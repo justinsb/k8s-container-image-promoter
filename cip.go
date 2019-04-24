@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -24,6 +25,7 @@ import (
 	"os"
 
 	// nolint[lll]
+	"k8s.io/klog"
 	reg "sigs.k8s.io/k8s-container-image-promoter/lib/dockerregistry"
 	"sigs.k8s.io/k8s-container-image-promoter/lib/stream"
 )
@@ -39,6 +41,10 @@ var TimestampUtcRfc3339 string
 
 // nolint[gocyclo]
 func main() {
+	ctx := context.Background()
+
+	klog.InitFlags(nil)
+
 	manifestPtr := flag.String(
 		"manifest", "", "the manifest file to load (REQUIRED)")
 	garbageCollectPtr := flag.Bool(
@@ -133,6 +139,17 @@ func main() {
 		os.Exit(0)
 	}
 
+	if *dryRunPtr {
+		fmt.Printf("********** START (DRY RUN): %s **********\n", *manifestPtr)
+	} else {
+		fmt.Printf("********** START: %s **********\n", *manifestPtr)
+	}
+
+	if err := runImagePromotion(ctx, &mfest, *dryRunPtr, !noSvcAcc); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// If there are no images in the manifest, it may be a stub manifest file
 	// (such as for brand new registries that would be watched by the promoter
 	// for the very first time). In any case, we do NOT want to process such
@@ -143,12 +160,6 @@ func main() {
 	if len(mfest.Images) == 0 {
 		fmt.Println("No images in manifest --- nothing to do.")
 		os.Exit(0)
-	}
-
-	if *dryRunPtr {
-		fmt.Printf("********** START (DRY RUN): %s **********\n", *manifestPtr)
-	} else {
-		fmt.Printf("********** START: %s **********\n", *manifestPtr)
 	}
 
 	// Populate access tokens for all registries listed in the manifest.
@@ -242,4 +253,43 @@ func printVersion() {
 func printUsage() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
 	flag.PrintDefaults()
+}
+
+func runImagePromotion(ctx context.Context, manifest *reg.Manifest, dryRun bool, useServiceAccount bool) error {
+	if len(manifest.Filestores) == 0 {
+		return nil
+	}
+
+	var source *reg.Filestore
+	for _, filestore := range manifest.Filestores {
+		// TODO: Make the source filestore a different field?
+		if filestore.Src {
+			if source != nil {
+				return fmt.Errorf("found multiple source filestores")
+			}
+			source = filestore
+		}
+	}
+	if source == nil {
+		return fmt.Errorf("source filestore not found")
+	}
+
+	for _, filestore := range manifest.Filestores {
+		if filestore.Src {
+			continue
+		}
+		fmt.Printf("---------- BEGIN FILE PROMOTION: %s ----------\n", filestore.Base)
+		p := reg.FilestorePromoter{
+			Source:            source,
+			Dest:              filestore,
+			Files:             manifest.Files,
+			Out:               os.Stdout,
+			DryRun:            dryRun,
+			UseServiceAccount: useServiceAccount,
+		}
+		if _, err := p.Promote(ctx); err != nil {
+			return fmt.Errorf("error during image promotion: %v", err)
+		}
+	}
+	return nil
 }
