@@ -574,17 +574,13 @@ func (sc *SyncContext) ReadRepository(tagFetcher func(sc *SyncContext, rc Regist
 	// Collect all images in sc.Inv (the src and dest registry names found in
 	// the manifest).
 
-	var queue []RegistryContext
-	queue = append(queue, sc.RegistryContexts...)
+	var mutex sync.Mutex
 
+	pool := NewPool()
+
+	var process func(rc RegistryContext) error
 	{
-		for {
-			if len(queue) == 0 {
-				break
-			}
-			rc := queue[0]
-			queue = queue[1:]
-
+		process = func(rc RegistryContext) error {
 			// Process the current repo.
 			rName := rc.Name
 			digestTags := make(DigestTags)
@@ -604,9 +600,11 @@ func (sc *SyncContext) ReadRepository(tagFetcher func(sc *SyncContext, rc Regist
 				// Store MediaType.
 				mediaType, err := supportedMediaType(mfestInfo.MediaType)
 				if err != nil {
-					return nil, fmt.Errorf("digest %s: %v", digest, err)
+					return fmt.Errorf("digest %s: %v", digest, err)
 				}
+				mutex.Lock()
 				sc.DigestMediaType[Digest(digest)] = mediaType
+				mutex.Unlock()
 			}
 
 			// Only write an entry into our inventory if the entry has some
@@ -634,12 +632,14 @@ func (sc *SyncContext) ReadRepository(tagFetcher func(sc *SyncContext, rc Regist
 				currentRepo := make(RegInvImage)
 				currentRepo[imageName] = digestTags
 
+				mutex.Lock()
 				existingRegEntry := sc.Inv[RegistryName(tokenKey)]
 				if len(existingRegEntry) == 0 {
 					sc.Inv[RegistryName(tokenKey)] = currentRepo
 				} else {
 					sc.Inv[RegistryName(tokenKey)][imageName] = digestTags
 				}
+				mutex.Unlock()
 			}
 
 			// Process child repos.
@@ -661,12 +661,71 @@ func (sc *SyncContext) ReadRepository(tagFetcher func(sc *SyncContext, rc Regist
 					// (don't care if it's the source reg or not).
 				}
 
-				queue = append(queue, childRc)
+				pool.Queue(func() error {
+					return process(childRc)
+				})
 			}
+
+			return nil
 		}
 	}
 
+	for i := range sc.RegistryContexts {
+		rc := sc.RegistryContexts[i]
+		pool.Queue(func() error {
+			return process(rc)
+		})
+	}
+
+	errors := pool.Run(10)
+	if len(errors) != 0 {
+		return errors[0]
+	}
 	return nil
+}
+
+func NewPool() *Pool {
+	return &Pool{
+		// Bounded channels cause deadlock.
+		queue: make(chan (func() error), 1000000),
+	}
+}
+
+type Pool struct {
+	mutex sync.Mutex
+	queue chan (func() error)
+	wg    sync.WaitGroup
+}
+
+func (p *Pool) Queue(f func() error) {
+	p.mutex.Lock()
+	p.wg.Add(1)
+	p.queue <- f
+	p.mutex.Unlock()
+}
+
+func (p *Pool) Run(concurrency int) []error {
+	var errors []error
+
+	for i := 1; i < concurrency; i++ {
+		go func() {
+			for f := range p.queue {
+				err := f()
+
+				if err != nil {
+					p.mutex.Lock()
+					errors = append(errors, err)
+					p.mutex.Unlock()
+				}
+				p.wg.Add(-1)
+			}
+		}()
+	}
+
+	p.wg.Wait()
+	close(p.queue)
+
+	return errors
 }
 
 // FetchTags queries the registry to get the tags.
